@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    container_name: soc2-postgres
+    restart: always # Baza sama wstanie po restarcie serwera
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: soc2_agent
+    ports:
+      - "5422:5432" # Zakładam, że używałeś portu 5422
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  agent:
+    build: .
+    container_name: soc2-agent
+    restart: always # Skrypt sam wstanie w razie błędu!
+    depends_on:
+      - db
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY} # Zaciąga klucz z pliku .env
+    # Ważne: Agent musi "widzieć" bazę z Dockera, więc zmieniamy hosta wewnątrz kontenera
+    command: >
+      sh -c "sed -i 's/\"host\": \"localhost\"/\"host\": \"db\"/g' main.py && python main.py"
+
+volumes:
+  postgres_data:
