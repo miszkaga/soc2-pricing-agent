@@ -1,4 +1,5 @@
 import os
+from web_researcher import WebResearcher
 import base64
 import psycopg2
 import json
@@ -26,62 +27,57 @@ DB_CONFIG = {
     "dbname": "soc2_agent",
     "user": "admin",
     "password": "password123",
-    "host": "db",
-    "port": "5432"
+    "host": "db",      # Ustawione dla Dockera
+    "port": "5432"     # Ustawione dla Dockera
 }
 
 # ==========================================
-# 1. SILNIK WYCENY AUDITSOLUTIONS
+# 1. NOWY INTELIGENTNY SILNIK WYCENY V2
 # ==========================================
-class AuditsolutionsPricing:
+class AuditsolutionsPricingV2:
     def __init__(self):
-        self.base_security = 18500.0
-        self.domains = {
-            'availability': 3900.0,
-            'confidentiality': 3900.0,
-            'processing integrity': 7600.0,
-            'privacy': 9400.0
-        }
+        self.base_rate_eur_per_md = 800.0
 
-    def calculate(self, data) -> dict:
-        if data.liczba_pracownikow and data.liczba_pracownikow > 500:
-            return {"status": "wycena_indywidualna"}
+    def calculate(self, data, research) -> dict:
+        base_md = 15.0
 
-        base = self.base_security
-        if data.posiada_iso27001:
-            base = base * 0.85
+        if data.liczba_pracownikow:
+            if data.liczba_pracownikow > 500: base_md += 20.0
+            elif data.liczba_pracownikow > 200: base_md += 10.0
+            elif data.liczba_pracownikow > 50: base_md += 5.0
 
-        domains_sum = base
+        if data.infrastruktura and "on-premise" in data.infrastruktura.lower():
+            base_md += 5.0
+
         if data.dodatkowe_domeny:
-            for domain in data.dodatkowe_domeny:
-                for known_domain, price in self.domains.items():
-                    if known_domain in domain.lower():
-                        domains_sum += price
-                        break
+            base_md += (len(data.dodatkowe_domeny) * 4.0)
 
-        duration_premium = 0
-        typ_audytu = (data.typ_audytu or "").lower()
-        if "type ii" in typ_audytu:
-            if "12" in typ_audytu:
-                duration_premium = domains_sum * 0.30
-            else:
-                duration_premium = domains_sum * 0.15
+        branza = (research.get("branza") or "").lower()
+        if any(x in branza for x in ["fintech", "medtech", "banking", "crypto", "ecommerce", "enterprise"]):
+            base_md *= 1.30
 
-        size_surcharge = 5000.0 if (data.liczba_pracownikow and data.liczba_pracownikow > 200) else 0
+        if data.posiada_iso27001: base_md *= 0.85
+        if data.korzysta_z_narzedzi_compliance: base_md *= 0.80
 
-        infra_surcharge = 0
-        infra = (data.infrastruktura_chmurowa or "").lower()
-        if "on-premise" in infra or "hybryd" in infra:
-            infra_surcharge = 4000.0
+        margin = 0.25
+        kraj = (research.get("kraj_centrali") or "Polska").lower()
+        if any(x in kraj for x in ["usa", "uk", "germany", "switzerland"]):
+            margin += 0.20
 
-        locs = data.dodatkowe_lokalizacje_fizyczne or 0
-        location_surcharge = locs * 1500.0
+        if (research.get("szacowane_przychody_mln_usd") or 0) > 50:
+            margin += 0.15
 
-        total = domains_sum + duration_premium + size_surcharge + infra_surcharge + location_surcharge
+        is_high_risk = (data.liczba_pracownikow or 0) > 200 and not data.posiada_iso27001
+        model = "Time & Material" if is_high_risk else "Fixed Price"
+
+        cost_t1 = round(base_md * self.base_rate_eur_per_md * (1 + margin), 2)
+        cost_t2 = round((base_md * 1.5) * self.base_rate_eur_per_md * (1 + margin), 2)
 
         return {
-            "status": "sukces",
-            "total_eur": round(total, 2)
+            "rekomendowany_model": model,
+            "wycena_type1_eur": cost_t1,
+            "wycena_type2_eur": cost_t2,
+            "szacowane_md_type1": round(base_md, 1)
         }
 
 # ==========================================
@@ -89,107 +85,141 @@ class AuditsolutionsPricing:
 # ==========================================
 
 class Soc2Extraction(BaseModel):
+    # --- BEZPIECZNE DANE (z maila) ---
     liczba_pracownikow: Optional[int] = Field(description="Liczba pracowników. Zwróć null, jeśli brak w tekście.")
-    infrastruktura_chmurowa: Optional[str] = Field(description="Dostawca chmury (np. AWS, Azure) lub On-premise/Hybryda. Zwróć null, jeśli brak.")
-    dodatkowe_lokalizacje_fizyczne: Optional[int] = Field(description="Liczba dodatkowych fizycznych biur/lokalizacji. Zwróć null, jeśli brak.")
-    dodatkowe_domeny: Optional[List[str]] = Field(description="Domeny SOC 2 poza Security (np. Availability, Confidentiality, Processing Integrity, Privacy). Zwróć puste jeśli wprost odrzucono, null jeśli w ogóle nie wspomniano.")
-    typ_audytu: Optional[str] = Field(description="Typ audytu: Type I, Type II 6m, Type II 12m. Zwróć null, jeśli brak.")
+    infrastruktura: Optional[str] = Field(description="Dostawca chmury (np. AWS, Azure) lub On-premise/Hybryda. Zwróć null, jeśli brak.")
+    dodatkowe_domeny: Optional[List[str]] = Field(description="Domeny SOC 2 poza Security. Zwróć puste jeśli wprost odrzucono, null jeśli w ogóle nie wspomniano.")
+    typ_audytu_zapytanie: Optional[List[str]] = Field(description="O co pyta klient? Np. ['Type 1'] lub ['Type 1', 'Type 2']. Zwróć null, jeśli brak.")
     posiada_iso27001: Optional[bool] = Field(description="Czy organizacja posiada certyfikat ISO 27001? True/False/null.")
+    korzysta_z_narzedzi_compliance: Optional[bool] = Field(description="Czy wspomina o narzędziach typu Vanta, Drata? True/False/null.")
+    # --- DANE "Ciche" (z nagłówków) ---
+    domena_firmowa: Optional[str] = Field(description="Domena firmy wyciągnięta z adresu e-mail nadawcy lub stopki (np. szybkitom.pl).")
+
+class ResearchPlan(BaseModel):
+    nazwa_firmy: str = Field(description="Zidentyfikowana nazwa firmy na podstawie maila/domeny.")
+    zebrane_zmienne: List[str] = Field(description="Lista parametrów, które z sukcesem wyciągnięto z maila (np. 'liczba_pracownikow', 'chmura', 'iso27001').")
+    brakujace_zmienne: List[str] = Field(description="Lista parametrów z silnika wyceny, których musimy poszukać w sieci (np. 'branza', 'kraj_centrali', 'szacowane_przychody').")
+    zapytania_wyszukiwarki: List[str] = Field(description="3-4 precyzyjne zapytania do wyszukiwarki Google, które pozwolą znaleźć brakujące dane.")
 
 class AgentState(TypedDict):
     email_content: str
     extracted_data: Optional[Soc2Extraction]
+    research_data: Optional[dict]
     draft_response: Optional[str]
 
 def extraction_node(state: AgentState):
-    print("🤖 Agent czyta e-mail i wyciąga dane...")
+    print("🤖 Agent czyta e-mail i wyciąga bezpieczne dane...")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
     structured_llm = llm.with_structured_output(Soc2Extraction)
-    prompt = f"Wyciągnij informacje do wyceny audytu SOC2. Szukaj uważnie 6 parametrów:\n\n{state['email_content']}"
+    prompt = f"Wyciągnij kluczowe informacje z tego wątku. Szukaj uważnie:\n\n{state['email_content']}"
     result = structured_llm.invoke(prompt)
     return {"extracted_data": result}
 
 def responder_node(state: AgentState):
-    print("✍️ Brakuje danych. Komponuję pytania z szablonu Auditsolutions...")
+    print("✍️ Brakuje bezpiecznych danych. Komponuję niezobowiązujące pytania...")
     data = state['extracted_data']
     missing_questions = []
 
     if data.liczba_pracownikow is None:
-        missing_questions.append("- Jaka jest ogólna liczba pracowników/współpracowników w Państwa organizacji?")
-    if data.infrastruktura_chmurowa is None:
-        missing_questions.append("- Z jakiego dostawcy chmury Państwo korzystają, czy posiadają własne serwery (on-premise) / środowisko hybrydowe?")
-    if data.dodatkowe_lokalizacje_fizyczne is None:
-        missing_questions.append("- Czy organizacja posiada dodatkowe lokalizacje fizyczne (inne biura), które podlegają audytowi? (Prosimy podać liczbę).")
+        missing_questions.append("- Jaka jest szacunkowa wielkość Państwa zespołu (liczba pracowników/współpracowników)?")
+    if data.infrastruktura is None:
+        missing_questions.append("- W jakim środowisku utrzymywana jest Państwa aplikacja (np. w 100% chmura AWS/Azure, czy posiadają Państwo własne serwery)?")
     if data.dodatkowe_domeny is None:
-        missing_questions.append("- Czy potrzebują Państwo rozszerzyć bazowy audyt o dodatkowe domeny? (Availability, Confidentiality, Processing Integrity, Privacy).")
-    if data.typ_audytu is None:
-        missing_questions.append("- Jaki typ audytu Państwa interesuje: Type I (punkt w czasie) czy Type II (okres obserwacji np. 6 lub 12 m-cy)?")
+        missing_questions.append("- Czy docelowy audyt ma objąć wyłącznie domenę Security, czy również dodatkowe kryteria (np. Availability, Confidentiality)?")
+    if data.typ_audytu_zapytanie is None:
+        missing_questions.append("- Jaki typ raportu Państwa interesuje na początek: Type 1 (punkt w czasie) czy od razu Type 2 (okres obserwacji)?")
     if data.posiada_iso27001 is None:
-        missing_questions.append("- Czy organizacja posiada już certyfikat ISO/IEC 27001?")
+        missing_questions.append("- Czy posiadają Państwo wdrożony system zarządzania bezpieczeństwem (np. certyfikat ISO 27001)?")
+    if data.korzysta_z_narzedzi_compliance is None:
+        missing_questions.append("- Czy korzystają Państwo (lub planują wdrożenie) platform automatyzujących compliance, takich jak Vanta czy Drata?")
 
     questions_text = "\n".join(missing_questions)
 
     draft = f"""Dzień dobry,
 
-Dziękujemy za kontakt. Aby móc rzetelnie wycenić audyt SOC 2 i przygotować dla Państwa dedykowaną ofertę, potrzebujemy uzupełnić kilka kluczowych informacji o Państwa organizacji.
+Dziękujemy za kontakt i zainteresowanie naszymi usługami. Aby móc rzetelnie oszacować pracochłonność audytu SOC 2 i przygotować dla Państwa dedykowaną wycenę, potrzebujemy uzupełnić kilka informacji technicznych o Państwa środowisku.
 
 Prosimy o krótkie odpowiedzi na poniższe pytania:
 {questions_text}
 
-Po otrzymaniu tych informacji, niezwłocznie przygotujemy dla Państwa kompleksowy kosztorys.
+Po otrzymaniu tych informacji, niezwłocznie prześlemy kalkulację kosztów.
 
 Z poważaniem,
 Zespół Auditsolutions
 """
     return {"draft_response": draft}
 
+def research_node(state: AgentState):
+    domena = state['extracted_data'].domena_firmowa or "nieznana"
+    print(f"\n🕵️‍♂️ Faza 1: Planowanie OSINT dla: {domena}")
+
+    # A. Tworzymy plan (tak jak wcześniej)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    structured_llm = llm.with_structured_output(ResearchPlan)
+
+    plan_prompt = f"""
+    Zidentyfikuj firmę dla domeny {domena}. 
+    Stwórz 3 zapytania do wyszukiwarki, aby znaleźć jej branżę, kraj i przychody.
+    Dane z maila: {state['extracted_data'].model_dump_json()}
+    """
+    plan = structured_llm.invoke(plan_prompt)
+
+    # B. Wywołujemy OSOBNY skrypt do przeszukania sieci (To jest nowość!)
+    researcher = WebResearcher()
+    found_data = researcher.search_and_analyze(plan.nazwa_firmy, plan.zapytania_wyszukiwarki)
+
+    print(f"✅ OSINT zakończony. Branża: {found_data['branza']}, Przychody: {found_data['szacowane_przychody_mln_usd']}M")
+
+    # C. Przygotowujemy raport dla Ciebie
+    draft = f"""[WEWNĘTRZNY RAPORT OSINT]
+Zakończyłem badanie firmy: {plan.nazwa_firmy}
+
+DANE ZNALEZIONE W SIECI:
+- Branża: {found_data['branza']}
+- Kraj: {found_data['kraj_centrali']}
+- Szacunkowe przychody: {found_data['szacowane_przychody_mln_usd']} mln USD
+"""
+
+    # Przekazujemy found_data do research_data – teraz Pricer będzie miał na czym pracować!
+    return {"draft_response": draft, "research_data": found_data}
+
 def pricing_node(state: AgentState):
-    print("💶 Mamy komplet! Uruchamiam Silnik Wyceny Auditsolutions...")
-    data = state['extracted_data']
-    calculator = AuditsolutionsPricing()
-    result = calculator.calculate(data)
+    # TEN WĘZEŁ BĘDZIE CHWILOWO POMINIĘTY W GRAFIE
+    pass
 
-    if result["status"] == "wycena_indywidualna":
-        draft = "Dzień dobry,\n\nDziękujemy za przekazanie szczegółów. Z uwagi na skalę Państwa organizacji (powyżej 500 pracowników), projekt ten wymaga niestandardowego podejścia.\nNasz audytor skontaktuje się z Państwem bezpośrednio w celu ustalenia terminu krótkiego spotkania (scoping call).\n\nZ wyrazami szacunku,\nZespół Auditsolutions"
-    else:
-        cena = result["total_eur"]
-        draft = f"Dzień dobry,\n\nDziękujemy za przekazanie wszystkich informacji. Na ich podstawie nasz system wygenerował wstępny kosztorys audytu SOC 2.\n\nSzacunkowy koszt inwestycji dla wskazanych parametrów wynosi: {cena} EUR netto.\n\n[TUTAJ DOCELOWO BĘDZIE ZALĄCZNIK PDF Z MACIERZĄ WYCENY]\n\nZ poważaniem,\nZespół Auditsolutions"
-
-    return {"draft_response": draft}
-
-def should_continue(state: AgentState):
+def routing_logic(state: AgentState):
     data = state['extracted_data']
     if (data and
             data.liczba_pracownikow is not None and
-            data.infrastruktura_chmurowa is not None and
-            data.dodatkowe_lokalizacje_fizyczne is not None and
+            data.infrastruktura is not None and
             data.dodatkowe_domeny is not None and
-            data.typ_audytu is not None and
-            data.posiada_iso27001 is not None):
-        return "complete"
+            data.typ_audytu_zapytanie is not None and
+            data.posiada_iso27001 is not None and
+            data.korzysta_z_narzedzi_compliance is not None):
+        return "go_research"
     else:
-        return "incomplete"
+        return "ask_more"
 
 workflow = StateGraph(AgentState)
 workflow.add_node("extractor", extraction_node)
 workflow.add_node("responder", responder_node)
+workflow.add_node("researcher", research_node)
 workflow.add_node("pricer", pricing_node)
 
 workflow.set_entry_point("extractor")
-workflow.add_conditional_edges(
-    "extractor",
-    should_continue,
-    {
-        "incomplete": "responder",
-        "complete": "pricer"
-    }
-)
+workflow.add_conditional_edges("extractor", routing_logic, {
+    "ask_more": "responder",
+    "go_research": "researcher"
+})
 workflow.add_edge("responder", END)
+# ZMIANA: Z researcher od razu kończymy (nie idziemy do pricer)
+workflow.add_edge("researcher", "pricer")
 workflow.add_edge("pricer", END)
+
 agent_app = workflow.compile()
 
 # ==========================================
-# 3. GMAIL & BAZA (ZAKTUALIZOWANA LOGIKA WIADOMOŚCI)
+# 3. GMAIL & BAZA DANYCH
 # ==========================================
 
 def init_db():
@@ -270,8 +300,8 @@ def get_unread_emails():
     service = get_gmail_service()
     print("Szukam nieprzeczytanych wiadomości...")
 
-    # TUTAJ DODALIŚMY FILTR: from:user@example.com
-    results = service.users().messages().list(userId='me', q='is:unread from:user@example.com', maxResults=3).execute()
+    query = 'is:unread (from:user@example.com OR from:miszkaga@gmail.com)'
+    results = service.users().messages().list(userId='me', q=query, maxResults=3).execute()
     messages = results.get('messages', [])
 
     if not messages:
@@ -315,6 +345,7 @@ def get_unread_emails():
         initial_state = {
             "email_content": body.strip(),
             "extracted_data": None,
+            "research_data": None,
             "draft_response": None
         }
 
@@ -336,7 +367,6 @@ def get_unread_emails():
         print("="*50 + "\n")
 
         mark_message_as_processed(message_id, thread_id, extracted)
-
 
 if __name__ == '__main__':
     init_db()
