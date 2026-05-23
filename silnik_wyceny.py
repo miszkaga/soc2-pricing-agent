@@ -72,7 +72,7 @@ class AuditsolutionsPricingV2:
         for key, aliases in self.AREA_ALIASES.items():
             for alias in aliases:
                 alias_normalized = " ".join(re.split(r"[^a-z0-9]+", alias.lower())).strip()
-                if normalized == alias_normalized or f" {alias_normalized} " in f" {normalized} ":
+                if self._matches_alias(normalized, alias_normalized):
                     return key
         return None
 
@@ -123,14 +123,21 @@ class AuditsolutionsPricingV2:
                 score -= 0.03
                 notes.append("skala: przychody < 10 mln USD")
 
+        # Ograniczamy X do realistycznego przedziału, aby nie schodzić poniżej minimum lub ponad maksimum widełek.
         score = min(max(score, 0.2), 0.85)
         return score, notes
+
+    @staticmethod
+    def _matches_alias(normalized_text: str, alias_text: str) -> bool:
+        # Spacje po bokach zapobiegają dopasowaniom częściowym (np. "testavailability").
+        return normalized_text == alias_text or f" {alias_text} " in f" {normalized_text} "
 
     @staticmethod
     def _estimate_from_range(min_value: float, max_value: float, factor: float) -> int:
         estimate = min_value + factor * (max_value - min_value)
         if estimate < 1000:
             return int(round(estimate))
+        # Dla większych kwot zaokrąglamy do setek, aby ustabilizować wyceny w widełkach.
         return int(round(estimate, -2))
 
     @staticmethod

@@ -140,8 +140,7 @@ def pricing_node(state: AgentState):
     areas_lines = []
     for area in pricing["areas"]:
         areas_lines.append(
-            f"- {area['label']}: {format_usd(area['min_usd'])}–{format_usd(area['max_usd'])} "
-            f"(szacunek: {format_usd(area['estimate_usd'])})"
+            f"- {area['label']}: {format_usd(area['min_usd'])}–{format_usd(area['max_usd'])} (szacunek: {format_usd(area['estimate_usd'])})"
         )
 
     factor_notes = pricing.get("x_factor_notes") or []
