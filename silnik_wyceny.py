@@ -100,7 +100,7 @@ class AuditsolutionsPricingV2:
 
         tz_offset = self._safe_int(research.get("strefa_czasowa_utc_offset"))
         if tz_offset is not None:
-            # Bazujemy na CET zimowym (UTC+1) jako punkcie odniesienia, bez uwzględnienia sezonowego DST.
+            # Bazujemy na CET zimowym (UTC+1); offset powinien odpowiadać czasowi standardowemu, nie sezonowemu.
             diff = abs(tz_offset - 1)
             if diff >= 6:
                 score += 0.07
@@ -144,7 +144,7 @@ class AuditsolutionsPricingV2:
         if estimate < 1000:
             return int(round(estimate))
         # Dla większych kwot zaokrąglamy do setek, aby ograniczyć „szum” i ułatwić komunikację ceny.
-        # round(x, -2) w Pythonie oznacza zaokrąglenie do setek (ujemna precyzja: dziesiątki i jedności).
+        # round(x, -2) w Pythonie oznacza zaokrąglenie do setek (ujemna precyzja: zeruje dziesiątki i jedności).
         return int(round(estimate, cls.ROUNDING_PRECISION_HUNDREDS))
 
     @staticmethod
