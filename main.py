@@ -1,5 +1,6 @@
 import os
 from web_researcher import WebResearcher
+from silnik_wyceny import AuditsolutionsPricingV2
 import base64
 import psycopg2
 import json
@@ -32,55 +33,6 @@ DB_CONFIG = {
 }
 
 # ==========================================
-# 1. NOWY INTELIGENTNY SILNIK WYCENY V2
-# ==========================================
-class AuditsolutionsPricingV2:
-    def __init__(self):
-        self.base_rate_eur_per_md = 800.0
-
-    def calculate(self, data, research) -> dict:
-        base_md = 15.0
-
-        if data.liczba_pracownikow:
-            if data.liczba_pracownikow > 500: base_md += 20.0
-            elif data.liczba_pracownikow > 200: base_md += 10.0
-            elif data.liczba_pracownikow > 50: base_md += 5.0
-
-        if data.infrastruktura and "on-premise" in data.infrastruktura.lower():
-            base_md += 5.0
-
-        if data.dodatkowe_domeny:
-            base_md += (len(data.dodatkowe_domeny) * 4.0)
-
-        branza = (research.get("branza") or "").lower()
-        if any(x in branza for x in ["fintech", "medtech", "banking", "crypto", "ecommerce", "enterprise"]):
-            base_md *= 1.30
-
-        if data.posiada_iso27001: base_md *= 0.85
-        if data.korzysta_z_narzedzi_compliance: base_md *= 0.80
-
-        margin = 0.25
-        kraj = (research.get("kraj_centrali") or "Polska").lower()
-        if any(x in kraj for x in ["usa", "uk", "germany", "switzerland"]):
-            margin += 0.20
-
-        if (research.get("szacowane_przychody_mln_usd") or 0) > 50:
-            margin += 0.15
-
-        is_high_risk = (data.liczba_pracownikow or 0) > 200 and not data.posiada_iso27001
-        model = "Time & Material" if is_high_risk else "Fixed Price"
-
-        cost_t1 = round(base_md * self.base_rate_eur_per_md * (1 + margin), 2)
-        cost_t2 = round((base_md * 1.5) * self.base_rate_eur_per_md * (1 + margin), 2)
-
-        return {
-            "rekomendowany_model": model,
-            "wycena_type1_eur": cost_t1,
-            "wycena_type2_eur": cost_t2,
-            "szacowane_md_type1": round(base_md, 1)
-        }
-
-# ==========================================
 # 2. DEFINICJA AGENTA (LANGGRAPH & PYDANTIC)
 # ==========================================
 
@@ -88,7 +40,7 @@ class Soc2Extraction(BaseModel):
     # --- BEZPIECZNE DANE (z maila) ---
     liczba_pracownikow: Optional[int] = Field(description="Liczba pracowników. Zwróć null, jeśli brak w tekście.")
     infrastruktura: Optional[str] = Field(description="Dostawca chmury (np. AWS, Azure) lub On-premise/Hybryda. Zwróć null, jeśli brak.")
-    dodatkowe_domeny: Optional[List[str]] = Field(description="Domeny SOC 2 poza Security. Zwróć puste jeśli wprost odrzucono, null jeśli w ogóle nie wspomniano.")
+    dodatkowe_domeny: Optional[List[str]] = Field(description="Dodatkowe obszary SOC 2 poza Security (Availability, Confidentiality, Processing Integrity, Privacy). Zwróć puste jeśli wprost odrzucono, null jeśli w ogóle nie wspomniano.")
     typ_audytu_zapytanie: Optional[List[str]] = Field(description="O co pyta klient? Np. ['Type 1'] lub ['Type 1', 'Type 2']. Zwróć null, jeśli brak.")
     posiada_iso27001: Optional[bool] = Field(description="Czy organizacja posiada certyfikat ISO 27001? True/False/null.")
     korzysta_z_narzedzi_compliance: Optional[bool] = Field(description="Czy wspomina o narzędziach typu Vanta, Drata? True/False/null.")
@@ -98,7 +50,7 @@ class Soc2Extraction(BaseModel):
 class ResearchPlan(BaseModel):
     nazwa_firmy: str = Field(description="Zidentyfikowana nazwa firmy na podstawie maila/domeny.")
     zebrane_zmienne: List[str] = Field(description="Lista parametrów, które z sukcesem wyciągnięto z maila (np. 'liczba_pracownikow', 'chmura', 'iso27001').")
-    brakujace_zmienne: List[str] = Field(description="Lista parametrów z silnika wyceny, których musimy poszukać w sieci (np. 'branza', 'kraj_centrali', 'szacowane_przychody').")
+    brakujace_zmienne: List[str] = Field(description="Lista parametrów z silnika wyceny, których musimy poszukać w sieci (np. 'branza', 'kraj_centrali', 'jezyk_glowny', 'strefa_czasowa_utc_offset', 'kultura_biznesowa').")
     zapytania_wyszukiwarki: List[str] = Field(description="3-4 precyzyjne zapytania do wyszukiwarki Google, które pozwolą znaleźć brakujące dane.")
 
 class AgentState(TypedDict):
@@ -106,6 +58,7 @@ class AgentState(TypedDict):
     extracted_data: Optional[Soc2Extraction]
     research_data: Optional[dict]
     draft_response: Optional[str]
+    pricing_data: Optional[dict]
 
 def extraction_node(state: AgentState):
     print("🤖 Agent czyta e-mail i wyciąga bezpieczne dane...")
@@ -159,7 +112,7 @@ def research_node(state: AgentState):
 
     plan_prompt = f"""
     Zidentyfikuj firmę dla domeny {domena}. 
-    Stwórz 3 zapytania do wyszukiwarki, aby znaleźć jej branżę, kraj i przychody.
+    Stwórz 3-4 zapytania do wyszukiwarki, aby znaleźć jej branżę, kraj, język, strefę czasową, kulturę biznesową oraz przychody.
     Dane z maila: {state['extracted_data'].model_dump_json()}
     """
     plan = structured_llm.invoke(plan_prompt)
@@ -170,22 +123,52 @@ def research_node(state: AgentState):
 
     print(f"✅ OSINT zakończony. Branża: {found_data['branza']}, Przychody: {found_data['szacowane_przychody_mln_usd']}M")
 
-    # C. Przygotowujemy raport dla Ciebie
-    draft = f"""[WEWNĘTRZNY RAPORT OSINT]
-Zakończyłem badanie firmy: {plan.nazwa_firmy}
-
-DANE ZNALEZIONE W SIECI:
-- Branża: {found_data['branza']}
-- Kraj: {found_data['kraj_centrali']}
-- Szacunkowe przychody: {found_data['szacowane_przychody_mln_usd']} mln USD
-"""
-
     # Przekazujemy found_data do research_data – teraz Pricer będzie miał na czym pracować!
-    return {"draft_response": draft, "research_data": found_data}
+    return {"research_data": found_data}
 
 def pricing_node(state: AgentState):
-    # TEN WĘZEŁ BĘDZIE CHWILOWO POMINIĘTY W GRAFIE
-    pass
+    # Generuje wycenę wstępną na podstawie danych z maila i OSINT
+    data = state['extracted_data']
+    research = state.get('research_data') or {}
+
+    pricer = AuditsolutionsPricingV2()
+    pricing = pricer.calculate(data, research)
+
+    def format_usd(value: float) -> str:
+        return f"${value:,.0f}"
+
+    areas_lines = []
+    for area in pricing["areas"]:
+        areas_lines.append(
+            f"- {area['label']}: {format_usd(area['min_usd'])}–{format_usd(area['max_usd'])} (szacunek: {format_usd(area['estimate_usd'])})"
+        )
+
+    factor_notes = pricing.get("x_factor_notes") or []
+    factor_notes_text = "\n".join(f"- {note}" for note in factor_notes) if factor_notes else "- brak istotnych korekt"
+
+    audit_list = data.typ_audytu_zapytanie or []
+    audit_types_str = ", ".join(audit_list) if audit_list else "nie podano"
+
+    draft = f"""[WYCENA WSTĘPNA SOC 2]
+Zakres obszarów: {", ".join(area['label'] for area in pricing["areas"])}
+Typ raportu (z maila): {audit_types_str}
+
+Współczynnik X: {pricing['x_factor']}
+Uzasadnienie X:
+{factor_notes_text}
+
+Rozbicie obszarów:
+{"\n".join(areas_lines)}
+
+Suma wstępna: {format_usd(pricing['total_estimate_usd'])}
+Zakres sumaryczny: {format_usd(pricing['total_min_usd'])}–{format_usd(pricing['total_max_usd'])}
+
+Uwagi:
+- Security jest zawsze obowiązkowe (baseline).
+- Każdy obszar jest liczony w ramach ustalonych widełek.
+"""
+
+    return {"draft_response": draft, "pricing_data": pricing}
 
 def routing_logic(state: AgentState):
     data = state['extracted_data']
@@ -212,7 +195,7 @@ workflow.add_conditional_edges("extractor", routing_logic, {
     "go_research": "researcher"
 })
 workflow.add_edge("responder", END)
-# ZMIANA: Z researcher od razu kończymy (nie idziemy do pricer)
+# Po research przechodzimy do pricer, aby policzyć wycenę
 workflow.add_edge("researcher", "pricer")
 workflow.add_edge("pricer", END)
 
@@ -346,7 +329,8 @@ def get_unread_emails():
             "email_content": body.strip(),
             "extracted_data": None,
             "research_data": None,
-            "draft_response": None
+            "draft_response": None,
+            "pricing_data": None
         }
 
         final_state = agent_app.invoke(initial_state)
