@@ -3,8 +3,10 @@ import re
 
 
 class AuditsolutionsPricingV2:
+    # Ograniczenia X zapewniają realistyczne skalowanie w ramach widełek cenowych.
     MIN_PRICING_FACTOR = 0.2
     MAX_PRICING_FACTOR = 0.85
+    # Zaokrąglamy większe kwoty do setek, aby wycena była stabilna i czytelna dla klienta.
     ROUNDING_PRECISION_HUNDREDS = -2
     AREA_RANGES_USD = {
         "security": {"label": "Security (Baseline)", "min": 22000, "max": 60000},
@@ -126,7 +128,7 @@ class AuditsolutionsPricingV2:
                 score -= 0.03
                 notes.append("skala: przychody < 10 mln USD")
 
-        # Ograniczamy X do realistycznego przedziału, aby nie schodzić poniżej minimum lub ponad maksimum widełek.
+        # Ograniczamy X do realistycznego przedziału, aby nie wypychać wyceny poza widełki obszarów.
         score = min(max(score, self.MIN_PRICING_FACTOR), self.MAX_PRICING_FACTOR)
         return score, notes
 
@@ -135,13 +137,13 @@ class AuditsolutionsPricingV2:
         # Spacje po bokach zapobiegają dopasowaniom częściowym (np. "testavailability").
         return normalized_text == alias_text or f" {alias_text} " in f" {normalized_text} "
 
-    @staticmethod
-    def _estimate_from_range(min_value: float, max_value: float, factor: float) -> int:
+    @classmethod
+    def _estimate_from_range(cls, min_value: float, max_value: float, factor: float) -> int:
         estimate = min_value + factor * (max_value - min_value)
         if estimate < 1000:
             return int(round(estimate))
-        # Dla większych kwot zaokrąglamy do setek, aby ustabilizować wyceny w widełkach.
-        return int(round(estimate, self.ROUNDING_PRECISION_HUNDREDS))
+        # Dla większych kwot zaokrąglamy do setek, aby ograniczyć „szum” i ułatwić komunikację ceny.
+        return int(round(estimate, cls.ROUNDING_PRECISION_HUNDREDS))
 
     @staticmethod
     def _safe_int(value):

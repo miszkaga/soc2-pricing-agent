@@ -146,7 +146,7 @@ def pricing_node(state: AgentState):
     factor_notes = pricing.get("x_factor_notes") or []
     factor_notes_text = "\n".join(f"- {note}" for note in factor_notes) if factor_notes else "- brak istotnych korekt"
 
-    audit_type = ", ".join(data.typ_audytu_zapytanie) if data and data.typ_audytu_zapytanie else "nie podano"
+    audit_type = ", ".join(data.typ_audytu_zapytanie) if data.typ_audytu_zapytanie else "nie podano"
 
     draft = f"""[WYCENA WSTĘPNA SOC 2]
 Zakres obszarów: {", ".join(area['label'] for area in pricing["areas"])}
