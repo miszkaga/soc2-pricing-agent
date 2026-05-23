@@ -1,5 +1,6 @@
 from typing import Optional
 import re
+import unicodedata
 
 
 class AuditsolutionsPricingV2:
@@ -72,11 +73,10 @@ class AuditsolutionsPricingV2:
     def _normalize_area_name(self, area_name: str) -> Optional[str]:
         if not area_name:
             return None
-        lowered = area_name.strip().lower()
-        normalized = " ".join(re.split(r"[^a-z0-9]+", lowered)).strip()
+        normalized = self._normalize_text(area_name)
         for key, aliases in self.AREA_ALIASES.items():
             for alias in aliases:
-                alias_normalized = " ".join(re.split(r"[^a-z0-9]+", alias.lower())).strip()
+                alias_normalized = self._normalize_text(alias)
                 if self._matches_alias(normalized, alias_normalized):
                     return key
         return None
@@ -100,7 +100,7 @@ class AuditsolutionsPricingV2:
 
         tz_offset = self._safe_int(research.get("strefa_czasowa_utc_offset"))
         if tz_offset is not None:
-            # Bazujemy na CET zimowym (UTC+1) jako punkcie odniesienia, bez sezonowego DST.
+            # Bazujemy na CET zimowym (UTC+1) jako punkcie odniesienia, bez uwzględnienia sezonowego DST.
             diff = abs(tz_offset - 1)
             if diff >= 6:
                 score += 0.07
@@ -135,9 +135,8 @@ class AuditsolutionsPricingV2:
 
     @staticmethod
     def _matches_alias(normalized_text: str, alias_text: str) -> bool:
-        # Dopasowanie po granicach słów chroni przed częściowymi trafieniami (np. "testavailability").
-        pattern = rf"\b{re.escape(alias_text)}\b"
-        return re.search(pattern, normalized_text) is not None
+        # Spacje po bokach zapobiegają dopasowaniom częściowym (np. "testavailability").
+        return f" {alias_text} " in f" {normalized_text} "
 
     @classmethod
     def _estimate_from_range(cls, min_value: float, max_value: float, factor: float) -> int:
@@ -145,8 +144,16 @@ class AuditsolutionsPricingV2:
         if estimate < 1000:
             return int(round(estimate))
         # Dla większych kwot zaokrąglamy do setek, aby ograniczyć „szum” i ułatwić komunikację ceny.
-        # round(x, -2) w Pythonie oznacza zaokrąglenie do setek (ujemna precyzja).
+        # round(x, -2) w Pythonie oznacza zaokrąglenie do setek (ujemna precyzja: dziesiątki i jedności).
         return int(round(estimate, cls.ROUNDING_PRECISION_HUNDREDS))
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        if not text:
+            return ""
+        normalized = unicodedata.normalize("NFKD", text)
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        return " ".join(re.split(r"[^a-z0-9]+", ascii_text.lower())).strip()
 
     @staticmethod
     def _safe_int(value):
