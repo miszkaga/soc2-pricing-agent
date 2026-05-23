@@ -7,6 +7,9 @@ class OSINTResults(BaseModel):
     branza: str = Field(description="Branża firmy (np. SaaS, FinTech, eCommerce).")
     kraj_centrali: str = Field(description="Główna lokalizacja firmy.")
     szacowane_przychody_mln_usd: float = Field(description="Przychód w mln USD (sama liczba). Jeśli nieznany, spróbuj oszacować na podstawie wielkości.")
+    jezyk_glowny: str = Field(description="Dominujący język komunikacji firmy (np. polski, angielski).")
+    strefa_czasowa_utc_offset: int = Field(description="Strefa czasowa centrali jako offset UTC w godzinach (np. -5, 0, 1, 2).")
+    kultura_biznesowa: str = Field(description="Krótki opis kultury biznesowej (np. korporacyjna/enterprise, startup, formalna, zwinna).")
 
 class WebResearcher:
     def __init__(self):
@@ -30,7 +33,7 @@ class WebResearcher:
 
         prompt = f"""
         Na podstawie poniższych danych z internetu o firmie '{company_name}', 
-        wyciągnij 3 parametry potrzebne do wyceny audytu.
+        wyciągnij parametry potrzebne do wyceny audytu (branża, kraj, przychody, język, strefa czasowa, kultura).
         
         DANE Z SIECI:
         {aggregated_context}
