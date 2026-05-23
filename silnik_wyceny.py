@@ -3,6 +3,9 @@ import re
 
 
 class AuditsolutionsPricingV2:
+    MIN_PRICING_FACTOR = 0.2
+    MAX_PRICING_FACTOR = 0.85
+    ROUNDING_PRECISION_HUNDREDS = -2
     AREA_RANGES_USD = {
         "security": {"label": "Security (Baseline)", "min": 22000, "max": 60000},
         "availability": {"label": "Availability", "min": 3000, "max": 9000},
@@ -124,7 +127,7 @@ class AuditsolutionsPricingV2:
                 notes.append("skala: przychody < 10 mln USD")
 
         # Ograniczamy X do realistycznego przedziału, aby nie schodzić poniżej minimum lub ponad maksimum widełek.
-        score = min(max(score, 0.2), 0.85)
+        score = min(max(score, self.MIN_PRICING_FACTOR), self.MAX_PRICING_FACTOR)
         return score, notes
 
     @staticmethod
@@ -138,7 +141,7 @@ class AuditsolutionsPricingV2:
         if estimate < 1000:
             return int(round(estimate))
         # Dla większych kwot zaokrąglamy do setek, aby ustabilizować wyceny w widełkach.
-        return int(round(estimate, -2))
+        return int(round(estimate, self.ROUNDING_PRECISION_HUNDREDS))
 
     @staticmethod
     def _safe_int(value):

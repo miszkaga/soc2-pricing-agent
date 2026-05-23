@@ -157,7 +157,7 @@ Uzasadnienie X:
 {factor_notes_text}
 
 Rozbicie obszarów:
-{chr(10).join(areas_lines)}
+{"\n".join(areas_lines)}
 
 Suma wstępna: {format_usd(pricing['total_estimate_usd'])}
 Zakres sumaryczny: {format_usd(pricing['total_min_usd'])}–{format_usd(pricing['total_max_usd'])}
