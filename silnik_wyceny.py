@@ -1,4 +1,5 @@
 from typing import Optional
+import re
 
 
 class AuditsolutionsPricingV2:
@@ -67,9 +68,12 @@ class AuditsolutionsPricingV2:
         if not area_name:
             return None
         lowered = area_name.strip().lower()
+        normalized = " ".join(re.split(r"[^a-z0-9]+", lowered)).strip()
         for key, aliases in self.AREA_ALIASES.items():
-            if lowered == key or any(alias in lowered for alias in aliases):
-                return key
+            for alias in aliases:
+                alias_normalized = " ".join(re.split(r"[^a-z0-9]+", alias.lower())).strip()
+                if normalized == alias_normalized or f" {alias_normalized} " in f" {normalized} ":
+                    return key
         return None
 
     def _pricing_factor(self, research: dict) -> tuple:
@@ -125,6 +129,8 @@ class AuditsolutionsPricingV2:
     @staticmethod
     def _estimate_from_range(min_value: float, max_value: float, factor: float) -> int:
         estimate = min_value + factor * (max_value - min_value)
+        if estimate < 1000:
+            return int(round(estimate))
         return int(round(estimate, -2))
 
     @staticmethod
