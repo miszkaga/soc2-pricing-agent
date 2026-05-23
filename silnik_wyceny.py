@@ -100,7 +100,7 @@ class AuditsolutionsPricingV2:
 
         tz_offset = self._safe_int(research.get("strefa_czasowa_utc_offset"))
         if tz_offset is not None:
-            # Bazujemy na CET (UTC+1) jako punkcie odniesienia, bez uwzględniania sezonowego DST.
+            # Bazujemy na CET zimowym (UTC+1) jako punkcie odniesienia, bez sezonowego DST.
             diff = abs(tz_offset - 1)
             if diff >= 6:
                 score += 0.07
@@ -135,8 +135,9 @@ class AuditsolutionsPricingV2:
 
     @staticmethod
     def _matches_alias(normalized_text: str, alias_text: str) -> bool:
-        # Spacje po bokach zapobiegają dopasowaniom częściowym (np. "testavailability").
-        return normalized_text == alias_text or f" {alias_text} " in f" {normalized_text} "
+        # Dopasowanie po granicach słów chroni przed częściowymi trafieniami (np. "testavailability").
+        pattern = rf"\b{re.escape(alias_text)}\b"
+        return re.search(pattern, normalized_text) is not None
 
     @classmethod
     def _estimate_from_range(cls, min_value: float, max_value: float, factor: float) -> int:

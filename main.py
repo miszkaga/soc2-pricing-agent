@@ -147,11 +147,11 @@ def pricing_node(state: AgentState):
     factor_notes_text = "\n".join(f"- {note}" for note in factor_notes) if factor_notes else "- brak istotnych korekt"
 
     audit_list = data.typ_audytu_zapytanie or []
-    audit_type = ", ".join(audit_list) if audit_list else "nie podano"
+    audit_types_str = ", ".join(audit_list) if audit_list else "nie podano"
 
     draft = f"""[WYCENA WSTĘPNA SOC 2]
 Zakres obszarów: {", ".join(area['label'] for area in pricing["areas"])}
-Typ raportu (z maila): {audit_type}
+Typ raportu (z maila): {audit_types_str}
 
 Współczynnik X: {pricing['x_factor']}
 Uzasadnienie X:
