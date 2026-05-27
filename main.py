@@ -1,12 +1,12 @@
 import os
-from web_researcher import WebResearcher
-from silnik_wyceny import AuditsolutionsPricingV2
 import base64
 import psycopg2
 import json
 import time
+import logging
 from dotenv import load_dotenv
 from email.message import EmailMessage
+from typing import Optional, List, TypedDict
 
 # Biblioteki Google (Gmail)
 from google.auth.transport.requests import Request
@@ -15,43 +15,41 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 # Biblioteki AI (LangChain / LangGraph)
-from typing import TypedDict, Optional, List
-from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
 
-# Ładowanie zmiennych środowiskowych (.env)
-load_dotenv()
-
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-DB_CONFIG = {
-    "dbname": "soc2_agent",
-    "user": "admin",
-    "password": "password123",
-    "host": "db",      # Ustawione dla Dockera
-    "port": "5432"     # Ustawione dla Dockera
-}
+# Własne moduły
+from web_researcher import WebResearcher
+from silnik_wyceny import AuditsolutionsPricingV2
 
 # ==========================================
-# 2. DEFINICJA AGENTA (LANGGRAPH & PYDANTIC)
+# 1. KONFIGURACJA
+# ==========================================
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+# Używamy połączenia wewnątrz Dockera (host 'db')
+DB_URI = os.getenv("DB_URI", "postgresql://admin:password123@db:5432/soc2_agent")
+ALLOWED_EMAILS = ["user@example.com", "miszkaga@gmail.com"]
+
+# ==========================================
+# 2. DEFINICJA AGENTA (LANGGRAPH)
 # ==========================================
 
 class Soc2Extraction(BaseModel):
-    # --- BEZPIECZNE DANE (z maila) ---
-    liczba_pracownikow: Optional[int] = Field(description="Liczba pracowników. Zwróć null, jeśli brak w tekście.")
-    infrastruktura: Optional[str] = Field(description="Dostawca chmury (np. AWS, Azure) lub On-premise/Hybryda. Zwróć null, jeśli brak.")
-    dodatkowe_domeny: Optional[List[str]] = Field(description="Dodatkowe obszary SOC 2 poza Security (Availability, Confidentiality, Processing Integrity, Privacy). Zwróć puste jeśli wprost odrzucono, null jeśli w ogóle nie wspomniano.")
-    typ_audytu_zapytanie: Optional[List[str]] = Field(description="O co pyta klient? Np. ['Type 1'] lub ['Type 1', 'Type 2']. Zwróć null, jeśli brak.")
-    posiada_iso27001: Optional[bool] = Field(description="Czy organizacja posiada certyfikat ISO 27001? True/False/null.")
-    korzysta_z_narzedzi_compliance: Optional[bool] = Field(description="Czy wspomina o narzędziach typu Vanta, Drata? True/False/null.")
-    # --- DANE "Ciche" (z nagłówków) ---
-    domena_firmowa: Optional[str] = Field(description="Domena firmy wyciągnięta z adresu e-mail nadawcy lub stopki (np. szybkitom.pl).")
-
-class ResearchPlan(BaseModel):
-    nazwa_firmy: str = Field(description="Zidentyfikowana nazwa firmy na podstawie maila/domeny.")
-    zebrane_zmienne: List[str] = Field(description="Lista parametrów, które z sukcesem wyciągnięto z maila (np. 'liczba_pracownikow', 'chmura', 'iso27001').")
-    brakujace_zmienne: List[str] = Field(description="Lista parametrów z silnika wyceny, których musimy poszukać w sieci (np. 'branza', 'kraj_centrali', 'jezyk_glowny', 'strefa_czasowa_utc_offset', 'kultura_biznesowa').")
-    zapytania_wyszukiwarki: List[str] = Field(description="3-4 precyzyjne zapytania do wyszukiwarki Google, które pozwolą znaleźć brakujące dane.")
+    usluga_w_zakresie: Optional[str] = Field(description="Konkretna usługa/produkt do audytu. Jeśli cała firma, wpisz 'cała firma'. null jeśli brak.")
+    liczba_pracownikow: Optional[int] = Field(description="Liczba pracowników włączonych TYLKO w zakres audytu (in-scope). null jeśli brak.")
+    infrastruktura: Optional[str] = Field(description="Środowisko dla audytowanej usługi: np. AWS, Azure, On-premise. null jeśli brak.")
+    dodatkowe_domeny: Optional[List[str]] = Field(description="Domeny SOC 2. Jeśli klient pisze 'wszystkie', wstaw: ['Availability', 'Confidentiality', 'Processing Integrity', 'Privacy']. null jeśli brak.")
+    typ_audytu_zapytanie: Optional[List[str]] = Field(description="Type 1 lub Type 2. null jeśli brak.")
+    posiada_iso27001: Optional[bool] = Field(description="True/False/null")
+    korzysta_z_narzedzi_compliance: Optional[bool] = Field(description="Platformy Vanta, Drata. True/False/null")
+    domena_firmowa: Optional[str] = Field(description="Domena firmy np. onet.pl")
+    ocena_dojrzalosci_it: Optional[int] = Field(default=5, description="Skala 1-10 z OSINT")
 
 class AgentState(TypedDict):
     email_content: str
@@ -61,127 +59,85 @@ class AgentState(TypedDict):
     pricing_data: Optional[dict]
 
 def extraction_node(state: AgentState):
-    print("🤖 Agent czyta e-mail i wyciąga bezpieczne dane...")
+    print("🤖 Agent czyta e-mail i wyciąga dane (logika domen + System Boundary)...")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
     structured_llm = llm.with_structured_output(Soc2Extraction)
-    prompt = f"Wyciągnij kluczowe informacje z tego wątku. Szukaj uważnie:\n\n{state['email_content']}"
+
+    prompt = f"""Jesteś analitykiem biznesowym Big4 i ekspertem od audytów SOC 2.
+Twoim zadaniem jest analiza zapytań ofertowych i wyciąganie z nich ustrukturyzowanych danych.
+
+Kluczowe zasady i logika biznesowa:
+1. ZAKRES AUDYTU (System Boundary): Zidentyfikuj, czy audytujemy całą firmę, czy tylko konkretną usługę/produkt.
+2. PRACOWNICY: Wartość `liczba_pracownikow` ma dotyczyć TYLKO osób objętych zakresem audytu (in-scope). Jeśli korporacja ma 20 000 ludzi, ale nad audytowaną usługą pracuje 40, wpisz 40.
+3. DOMENY SOC 2: Jeśli klient prosi o "wszystkie domeny" lub "pełen audyt", użyj swojej wiedzy o SOC 2 i wylistuj wszystkie 4 dodatkowe Trust Services Criteria (Availability, Confidentiality, Processing Integrity, Privacy).
+4. INFRASTRUKTURA: Jeśli klient podaje technologię (np. AWS, Azure, GCP, własna serwerownia), wywnioskuj z tego środowisko.
+5. DOMENA FIRMY: Zawsze próbuj zidentyfikować domenę firmy na podstawie kontekstu.
+
+E-mail klienta:
+{state['email_content']}"""
+
     result = structured_llm.invoke(prompt)
     return {"extracted_data": result}
 
+    result = structured_llm.invoke(prompt)
+    return {"extracted_data": result}
 def responder_node(state: AgentState):
-    print("✍️ Brakuje bezpiecznych danych. Komponuję niezobowiązujące pytania...")
+    print("✍️ Brakuje danych. Komponuję pytania uzupełniające...")
     data = state['extracted_data']
-    missing_questions = []
+    missing = []
 
-    if data.liczba_pracownikow is None:
-        missing_questions.append("- Jaka jest szacunkowa wielkość Państwa zespołu (liczba pracowników/współpracowników)?")
-    if data.infrastruktura is None:
-        missing_questions.append("- W jakim środowisku utrzymywana jest Państwa aplikacja (np. w 100% chmura AWS/Azure, czy posiadają Państwo własne serwery)?")
-    if data.dodatkowe_domeny is None:
-        missing_questions.append("- Czy docelowy audyt ma objąć wyłącznie domenę Security, czy również dodatkowe kryteria (np. Availability, Confidentiality)?")
-    if data.typ_audytu_zapytanie is None:
-        missing_questions.append("- Jaki typ raportu Państwa interesuje na początek: Type 1 (punkt w czasie) czy od razu Type 2 (okres obserwacji)?")
-    if data.posiada_iso27001 is None:
-        missing_questions.append("- Czy posiadają Państwo wdrożony system zarządzania bezpieczeństwem (np. certyfikat ISO 27001)?")
-    if data.korzysta_z_narzedzi_compliance is None:
-        missing_questions.append("- Czy korzystają Państwo (lub planują wdrożenie) platform automatyzujących compliance, takich jak Vanta czy Drata?")
+    if data.usluga_w_zakresie is None: missing.append("- Jakiej konkretnie usługi lub produktu ma dotyczyć audyt (czy audytujemy całą firmę, czy wybrany system)?")
+    if data.liczba_pracownikow is None: missing.append("- Ile osób jest bezpośrednio zaangażowanych w utrzymanie i rozwój audytowanej usługi (tzw. zakres systemu)?")
+    if data.infrastruktura is None: missing.append("- W jakim środowisku utrzymywana jest ta usługa (np. chmura publiczna, własna serwerownia)?")
+    if data.dodatkowe_domeny is None: missing.append("- Czy audyt ma objąć dodatkowe kryteria (Availability, Confidentiality, Processing Integrity, Privacy)?")
+    if data.typ_audytu_zapytanie is None: missing.append("- Jaki typ raportu Państwa interesuje: Type 1 czy Type 2?")
+    if data.posiada_iso27001 is None: missing.append("- Czy środowisko objęte audytem posiada certyfikat ISO 27001?")
+    if data.korzysta_z_narzedzi_compliance is None: missing.append("- Czy korzystają Państwo z platform takich jak Vanta/Drata?")
 
-    questions_text = "\n".join(missing_questions)
-
-    draft = f"""Dzień dobry,
-
-Dziękujemy za kontakt i zainteresowanie naszymi usługami. Aby móc rzetelnie oszacować pracochłonność audytu SOC 2 i przygotować dla Państwa dedykowaną wycenę, potrzebujemy uzupełnić kilka informacji technicznych o Państwa środowisku.
-
-Prosimy o krótkie odpowiedzi na poniższe pytania:
-{questions_text}
-
-Po otrzymaniu tych informacji, niezwłocznie prześlemy kalkulację kosztów.
-
-Z poważaniem,
-Zespół Auditsolutions
-"""
+    questions = "\n".join(missing)
+    draft = f"Dzień dobry,\n\nAby przygotować wycenę SOC 2 dla zdefiniowanego zakresu, prosimy o odpowiedzi na:\n{questions}\n\nPozdrawiamy,\nZespół Auditsolutions"
     return {"draft_response": draft}
 
 def research_node(state: AgentState):
     domena = state['extracted_data'].domena_firmowa or "nieznana"
-    print(f"\n🕵️‍♂️ Faza 1: Planowanie OSINT dla: {domena}")
-
-    # A. Tworzymy plan (tak jak wcześniej)
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    structured_llm = llm.with_structured_output(ResearchPlan)
-
-    plan_prompt = f"""
-    Zidentyfikuj firmę dla domeny {domena}. 
-    Stwórz 3-4 zapytania do wyszukiwarki, aby znaleźć jej branżę, kraj, język, strefę czasową, kulturę biznesową oraz przychody.
-    Dane z maila: {state['extracted_data'].model_dump_json()}
-    """
-    plan = structured_llm.invoke(plan_prompt)
-
-    # B. Wywołujemy OSOBNY skrypt do przeszukania sieci (To jest nowość!)
+    print(f"🕵️‍♂️ Faza 1: Planowanie OSINT dla: {domena}")
     researcher = WebResearcher()
-    found_data = researcher.search_and_analyze(plan.nazwa_firmy, plan.zapytania_wyszukiwarki)
-
-    print(f"✅ OSINT zakończony. Branża: {found_data['branza']}, Przychody: {found_data['szacowane_przychody_mln_usd']}M")
-
-    # Przekazujemy found_data do research_data – teraz Pricer będzie miał na czym pracować!
+    found_data = researcher.search_and_analyze(domena, [f"company info, industry, revenue {domena}"])
     return {"research_data": found_data}
 
 def pricing_node(state: AgentState):
-    # Generuje wycenę wstępną na podstawie danych z maila i OSINT
+    print("💸 Faza 3: Obliczam wycenę z zewnętrznego modułu...")
     data = state['extracted_data']
     research = state.get('research_data') or {}
 
+    # Wstrzyknięcie danych z OSINT do modelu wyceny
+    data.ocena_dojrzalosci_it = research.get('ocena', 5)
+
     pricer = AuditsolutionsPricingV2()
-    pricing = pricer.calculate(data, research)
+    wycena = pricer.calculate(data)
 
-    def format_usd(value: float) -> str:
-        return f"${value:,.0f}"
-
-    areas_lines = []
-    for area in pricing["areas"]:
-        areas_lines.append(
-            f"- {area['label']}: {format_usd(area['min_usd'])}–{format_usd(area['max_usd'])} (szacunek: {format_usd(area['estimate_usd'])})"
-        )
-
-    factor_notes = pricing.get("x_factor_notes") or []
-    factor_notes_text = "\n".join(f"- {note}" for note in factor_notes) if factor_notes else "- brak istotnych korekt"
-
-    audit_list = data.typ_audytu_zapytanie or []
-    audit_types_str = ", ".join(audit_list) if audit_list else "nie podano"
-
-    draft = f"""[WYCENA WSTĘPNA SOC 2]
-Zakres obszarów: {", ".join(area['label'] for area in pricing["areas"])}
-Typ raportu (z maila): {audit_types_str}
-
-Współczynnik X: {pricing['x_factor']}
-Uzasadnienie X:
-{factor_notes_text}
-
-Rozbicie obszarów:
-{"\n".join(areas_lines)}
-
-Suma wstępna: {format_usd(pricing['total_estimate_usd'])}
-Zakres sumaryczny: {format_usd(pricing['total_min_usd'])}–{format_usd(pricing['total_max_usd'])}
-
-Uwagi:
-- Security jest zawsze obowiązkowe (baseline).
-- Każdy obszar jest liczony w ramach ustalonych widełek.
-"""
-
-    return {"draft_response": draft, "pricing_data": pricing}
+    draft = (
+        f"Dzień dobry,\n\n"
+        f"Na podstawie przekazanych informacji przygotowaliśmy wstępną ofertę:\n"
+        f"1. Rekomendowany model: {wycena['rekomendowany_model']}\n"
+        f"2. Wycena raportu Type 1: {wycena['wycena_type1_eur']} EUR netto\n"
+        f"3. Orientacyjny koszt raportu Type 2: {wycena['wycena_type2_eur']} EUR netto\n\n"
+        f"Czy chcieliby Państwo umówić się na spotkanie?\n\nZ poważaniem,\nZespół Auditsolutions"
+    )
+    return {"draft_response": draft, "pricing_data": wycena}
 
 def routing_logic(state: AgentState):
     data = state['extracted_data']
-    if (data and
-            data.liczba_pracownikow is not None and
-            data.infrastruktura is not None and
-            data.dodatkowe_domeny is not None and
-            data.typ_audytu_zapytanie is not None and
-            data.posiada_iso27001 is not None and
-            data.korzysta_z_narzedzi_compliance is not None):
+    if (data and data.liczba_pracownikow is not None and data.infrastruktura is not None):
         return "go_research"
-    else:
-        return "ask_more"
+    return "ask_more"
+
+# ==========================================
+# 3. KOMPILACJA GRAFU Z PAMIĘCIĄ
+# ==========================================
+pool = ConnectionPool(DB_URI, kwargs={"autocommit": True})
+checkpointer = PostgresSaver(pool)
+checkpointer.setup()
 
 workflow = StateGraph(AgentState)
 workflow.add_node("extractor", extraction_node)
@@ -195,18 +151,16 @@ workflow.add_conditional_edges("extractor", routing_logic, {
     "go_research": "researcher"
 })
 workflow.add_edge("responder", END)
-# Po research przechodzimy do pricer, aby policzyć wycenę
 workflow.add_edge("researcher", "pricer")
 workflow.add_edge("pricer", END)
 
-agent_app = workflow.compile()
+agent_app = workflow.compile(checkpointer=checkpointer)
 
 # ==========================================
-# 3. GMAIL & BAZA DANYCH
+# 4. FUNKCJE BAZY DANYCH (Historia maili)
 # ==========================================
-
 def init_db():
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(DB_URI)
     cur = conn.cursor()
     cur.execute('''
                 CREATE TABLE IF NOT EXISTS processed_messages (
@@ -221,16 +175,16 @@ def init_db():
     conn.close()
 
 def is_message_processed(message_id):
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(DB_URI)
     cur = conn.cursor()
     cur.execute("SELECT message_id FROM processed_messages WHERE message_id = %s", (message_id,))
-    result = cur.fetchone()
+    res = cur.fetchone()
     cur.close()
     conn.close()
-    return result is not None
+    return res is not None
 
 def mark_message_as_processed(message_id, thread_id, extracted_data):
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(DB_URI)
     cur = conn.cursor()
     json_data = json.dumps(extracted_data.model_dump()) if extracted_data else '{}'
     cur.execute(
@@ -241,6 +195,9 @@ def mark_message_as_processed(message_id, thread_id, extracted_data):
     cur.close()
     conn.close()
 
+# ==========================================
+# 5. GMAIL API I PĘTLA NASŁUCHUJĄCA
+# ==========================================
 def get_gmail_service():
     creds = None
     if os.path.exists('token.json'):
@@ -251,39 +208,42 @@ def get_gmail_service():
         else:
             flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
             creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+            with open('token.json', 'w') as token:
+                token.write(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 
 def create_gmail_draft(service, thread_id, body_text):
-    thread = service.users().threads().get(userId='me', id=thread_id).execute()
-    original_msg = thread['messages'][-1]
+    try:
+        thread = service.users().threads().get(userId='me', id=thread_id).execute()
+        original_msg = thread['messages'][-1]
 
-    headers = original_msg['payload']['headers']
-    to_email = next((h['value'] for h in headers if h['name'] == 'From'), "")
-    subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "Re: Zapytanie SOC 2")
+        headers = original_msg['payload']['headers']
+        to_email = next((h['value'] for h in headers if h['name'] == 'From'), "")
+        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "Re: Zapytanie SOC 2")
 
-    if not subject.lower().startswith("re:"):
-        subject = f"Re: {subject}"
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
 
-    message = EmailMessage()
-    message.set_content(body_text)
-    message['To'] = to_email
-    message['Subject'] = subject
-    message['In-Reply-To'] = original_msg['id']
-    message['References'] = original_msg['id']
+        message = EmailMessage()
+        message.set_content(body_text)
+        message['To'] = to_email
+        message['Subject'] = subject
+        message['In-Reply-To'] = original_msg['id']
+        message['References'] = original_msg['id']
 
-    encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    create_message = {'message': {'threadId': thread_id, 'raw': encoded_message}}
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        create_message = {'message': {'threadId': thread_id, 'raw': encoded_message}}
 
-    service.users().drafts().create(userId='me', body=create_message).execute()
-    print(f"📝 Utworzono szkic na koncie Gmail dla: {to_email}")
+        service.users().drafts().create(userId='me', body=create_message).execute()
+        print(f"📝 Utworzono szkic na koncie Gmail dla: {to_email}")
+    except Exception as e:
+        print(f"⚠️ Błąd podczas tworzenia draftu: {e}")
 
 def get_unread_emails():
     service = get_gmail_service()
-    print("Szukam nieprzeczytanych wiadomości...")
+    print("🔍 Szukam nieprzeczytanych wiadomości...")
 
-    query = 'is:unread (from:user@example.com OR from:miszkaga@gmail.com)'
+    query = 'is:unread (' + ' OR '.join([f'from:{e}' for e in ALLOWED_EMAILS]) + ')'
     results = service.users().messages().list(userId='me', q=query, maxResults=3).execute()
     messages = results.get('messages', [])
 
@@ -324,7 +284,9 @@ def get_unread_emails():
         print("\n" + "="*50)
         print(f"📧 NOWA WIADOMOŚĆ W WĄTKU: {subject}")
         print("="*50)
+        print("🤖 Uruchamiam LangGraph...")
 
+        config = {"configurable": {"thread_id": thread_id}}
         initial_state = {
             "email_content": body.strip(),
             "extracted_data": None,
@@ -333,7 +295,7 @@ def get_unread_emails():
             "pricing_data": None
         }
 
-        final_state = agent_app.invoke(initial_state)
+        final_state = agent_app.invoke(initial_state, config=config)
         extracted = final_state.get('extracted_data')
         draft_text = final_state.get('draft_response')
 
@@ -343,25 +305,22 @@ def get_unread_emails():
 
         if draft_text:
             print("\n" + "-"*30)
-            print("Treść przygotowanego SZKICU na Gmail:")
+            print("Treść przygotowanego SZKICU:")
             print(draft_text.strip())
-            print("-"*30)
+            print("-" * 30)
             create_gmail_draft(service, thread_id, draft_text)
 
         print("="*50 + "\n")
-
         mark_message_as_processed(message_id, thread_id, extracted)
 
 if __name__ == '__main__':
     init_db()
     print("🚀 Agent uruchomiony w trybie nasłuchiwania. (Naciśnij Ctrl+C, aby zatrzymać)")
-
     while True:
         try:
             get_unread_emails()
-            print("⏳ Zakończono sprawdzanie. Usypiam na 60 sekund...")
+            print("⏳ Zakończono sprawdzanie. Usypiam na 60 sekund...\n")
         except Exception as e:
-            print(f"⚠️ Wystąpił błąd podczas sprawdzania poczty: {e}")
-            print("⏳ Ponawiam próbę za 60 sekund...")
-
+            logging.error(f"⚠️ Błąd: {e}")
+            print("⏳ Ponawiam próbę za 60 sekund...\n")
         time.sleep(60)

@@ -1,170 +1,82 @@
-from typing import Optional
-import re
-import unicodedata
-
+# silnik_wyceny.py
 
 class AuditsolutionsPricingV2:
-    # Ograniczenia X zapewniają realistyczne skalowanie w ramach widełek cenowych.
-    MIN_PRICING_FACTOR = 0.2
-    MAX_PRICING_FACTOR = 0.85
-    # Zaokrąglamy większe kwoty do setek, aby wycena była stabilna i czytelna dla klienta.
-    ROUNDING_PRECISION_HUNDREDS = -2
-    AREA_RANGES_USD = {
-        "security": {"label": "Security (Baseline)", "min": 22000, "max": 60000},
-        "availability": {"label": "Availability", "min": 3000, "max": 9000},
-        "confidentiality": {"label": "Confidentiality", "min": 5000, "max": 12000},
-        "processing_integrity": {"label": "Processing Integrity", "min": 8000, "max": 18000},
-        "privacy": {"label": "Privacy", "min": 15000, "max": 35000},
-    }
-    AREA_ALIASES = {
-        "security": ["security", "bezpieczenstwo", "bezpieczeństwo", "baseline"],
-        "availability": ["availability", "dostepnosc", "dostępność"],
-        "confidentiality": ["confidentiality", "poufnosc", "poufność"],
-        "processing_integrity": ["processing integrity", "integrity", "integralnosc", "integralność", "jakosc", "jakość"],
-        "privacy": ["privacy", "prywatnosc", "prywatność"],
-    }
-    HIGH_COST_COUNTRY_KEYWORDS = ["usa", "united states", "uk", "united kingdom", "switzerland", "germany", "netherlands", "sweden", "norway", "denmark"]
-    LOW_COST_COUNTRY_KEYWORDS = ["poland", "polska", "czech", "slovakia", "romania", "bulgaria", "hungary"]
+    def __init__(self):
+        # Widełki wg wytycznych (USD/EUR)
+        # JEŚLI WYCENY SĄ ZA WYSOKIE/NISKIE, ZMIEŃ TYLKO TE WARTOŚCI:
+        self.ranges = {
+            "security": {"min": 12000, "max": 25000},
+            "availability": {"min": 2000, "max": 5000},
+            "confidentiality": {"min": 3000, "max": 6000},
+            "processing_integrity": {"min": 5000, "max": 10000},
+            "privacy": {"min": 8000, "max": 15000}
+        }
+        self.base_rate_eur_per_md = 800.0
 
-    def calculate(self, data, research: Optional[dict] = None) -> dict:
-        research = research or {}
-        selected_areas = self._select_areas(data)
-        factor, factor_notes = self._pricing_factor(research)
+    def calculate(self, data) -> dict:
+        # 1. USTALANIE WIDEŁEK BAZOWYCH
+        total_min = self.ranges["security"]["min"]
+        total_max = self.ranges["security"]["max"]
 
-        breakdown = []
-        total_min = 0
-        total_max = 0
-        total_estimate = 0
+        dodatkowe_domeny = getattr(data, 'dodatkowe_domeny', []) or []
+        for domena in dodatkowe_domeny:
+            d_lower = domena.lower()
+            if "availability" in d_lower or "dostępność" in d_lower:
+                total_min += self.ranges["availability"]["min"]
+                total_max += self.ranges["availability"]["max"]
+            elif "confidentiality" in d_lower or "poufność" in d_lower:
+                total_min += self.ranges["confidentiality"]["min"]
+                total_max += self.ranges["confidentiality"]["max"]
+            elif "processing integrity" in d_lower:
+                total_min += self.ranges["processing_integrity"]["min"]
+                total_max += self.ranges["processing_integrity"]["max"]
+            elif "privacy" in d_lower or "prywatność" in d_lower:
+                total_min += self.ranges["privacy"]["min"]
+                total_max += self.ranges["privacy"]["max"]
 
-        for area_key in selected_areas:
-            area = self.AREA_RANGES_USD[area_key]
-            estimate = self._estimate_from_range(area["min"], area["max"], factor)
-            breakdown.append({
-                "key": area_key,
-                "label": area["label"],
-                "min_usd": area["min"],
-                "max_usd": area["max"],
-                "estimate_usd": estimate
-            })
-            total_min += area["min"]
-            total_max += area["max"]
-            total_estimate += estimate
+        # 2. OBLICZANIE SUWAKA 'X'
+        x_score = 0.30
+
+        liczba_pracownikow = getattr(data, 'liczba_pracownikow', 0) or 0
+        if liczba_pracownikow > 500: x_score += 0.40
+        elif liczba_pracownikow > 200: x_score += 0.20
+        elif liczba_pracownikow > 50: x_score += 0.10
+
+        infrastruktura = getattr(data, 'infrastruktura', '') or ''
+        if "on-premise" in infrastruktura.lower() or "hybryd" in infrastruktura.lower():
+            x_score += 0.15
+
+        if getattr(data, 'posiada_iso27001', False): x_score -= 0.25
+        if getattr(data, 'korzysta_z_narzedzi_compliance', False): x_score -= 0.20
+
+        dojrzalosc = getattr(data, 'ocena_dojrzalosci_it', 5)
+        if dojrzalosc >= 8: x_score -= 0.15
+        elif dojrzalosc <= 3: x_score += 0.15
+
+        kraj = getattr(data, 'kraj_centrali', 'Polska').lower()
+        if any(k in kraj for k in ["usa", "united states", "canada", "mexico"]): x_score += 0.10
+
+        kultura_hierarchiczna = ["spain", "italy", "portugal", "greece", "india", "uae", "mexico", "brazil"]
+        if any(k in kraj for k in kultura_hierarchiczna): x_score += 0.15
+
+        przychody = getattr(data, 'szacowane_przychody_mln_usd', 0) or 0
+        if przychody > 50: x_score += 0.20
+
+        x_score = max(0.0, min(1.0, x_score))
+
+        # 3. WYLICZENIE FINALNEJ CENY
+        final_fee = total_min + (x_score * (total_max - total_min))
+        cost_type1 = round(final_fee, 2)
+        cost_type2 = round(final_fee * 1.5, 2)
+
+        is_high_risk = (liczba_pracownikow > 200) and not getattr(data, 'posiada_iso27001', False)
+        model = "Time & Material + wstępne Gap Analysis" if is_high_risk else "Fixed Price"
 
         return {
-            "x_factor": round(factor, 2),
-            "x_factor_notes": factor_notes,
-            "areas": breakdown,
-            "total_min_usd": total_min,
-            "total_max_usd": total_max,
-            "total_estimate_usd": total_estimate
+            "rekomendowany_model": model,
+            "wspolczynnik_x": round(x_score, 2),
+            "widellki_min": total_min,
+            "widellki_max": total_max,
+            "wycena_type1_eur": cost_type1,
+            "wycena_type2_eur": cost_type2
         }
-
-    def _select_areas(self, data) -> list:
-        selected = ["security"]
-        raw_areas = data.dodatkowe_domeny or []
-        if isinstance(raw_areas, str):
-            raw_areas = [raw_areas]
-        for area in raw_areas:
-            normalized = self._normalize_area_name(area)
-            if normalized and normalized not in selected and normalized != "security":
-                selected.append(normalized)
-        return selected
-
-    def _normalize_area_name(self, area_name: str) -> Optional[str]:
-        if not area_name:
-            return None
-        normalized = self._normalize_text(area_name)
-        for key, aliases in self.AREA_ALIASES.items():
-            for alias in aliases:
-                alias_normalized = self._normalize_text(alias)
-                if self._matches_alias(normalized, alias_normalized):
-                    return key
-        return None
-
-    def _pricing_factor(self, research: dict) -> tuple:
-        score = 0.5
-        notes = []
-
-        country = (research.get("kraj_centrali") or "").lower()
-        if any(keyword in country for keyword in self.HIGH_COST_COUNTRY_KEYWORDS):
-            score += 0.12
-            notes.append("geografia: rynek wysokokosztowy")
-        elif any(keyword in country for keyword in self.LOW_COST_COUNTRY_KEYWORDS):
-            score -= 0.08
-            notes.append("geografia: rynek niższokosztowy")
-
-        language = (research.get("jezyk_glowny") or "").lower()
-        if language and language not in ["polski", "polish", "english", "angielski"]:
-            score += 0.05
-            notes.append("język: dodatkowa warstwa komunikacji")
-
-        tz_offset = self._safe_int(research.get("strefa_czasowa_utc_offset"))
-        if tz_offset is not None:
-            # Bazujemy na CET zimowym (UTC+1); offset powinien odpowiadać czasowi standardowemu, nie sezonowemu.
-            diff = abs(tz_offset - 1)
-            if diff >= 6:
-                score += 0.07
-                notes.append("strefa czasowa: duża różnica względem CET")
-            elif diff >= 3:
-                score += 0.04
-                notes.append("strefa czasowa: umiarkowana różnica względem CET")
-
-        culture = (research.get("kultura_biznesowa") or "").lower()
-        if any(keyword in culture for keyword in ["korpor", "enterprise", "formal", "regulated", "korporacyjna"]):
-            score += 0.05
-            notes.append("kultura: korporacyjna/formalna")
-        elif any(keyword in culture for keyword in ["startup", "nieformal", "zwin", "agile"]):
-            score -= 0.03
-            notes.append("kultura: startupowa/nieformalna")
-
-        revenue = self._safe_float(research.get("szacowane_przychody_mln_usd"))
-        if revenue is not None:
-            if revenue > 100:
-                score += 0.05
-                notes.append("skala: przychody > 100 mln USD")
-            elif revenue > 50:
-                score += 0.03
-                notes.append("skala: przychody > 50 mln USD")
-            elif revenue < 10:
-                score -= 0.03
-                notes.append("skala: przychody < 10 mln USD")
-
-        # Ograniczamy X do realistycznego przedziału, aby nie wypychać wyceny poza widełki obszarów.
-        score = min(max(score, self.MIN_PRICING_FACTOR), self.MAX_PRICING_FACTOR)
-        return score, notes
-
-    @staticmethod
-    def _matches_alias(normalized_text: str, alias_text: str) -> bool:
-        # Spacje po bokach zapobiegają dopasowaniom częściowym (np. "testavailability").
-        return f" {alias_text} " in f" {normalized_text} "
-
-    @classmethod
-    def _estimate_from_range(cls, min_value: float, max_value: float, factor: float) -> int:
-        estimate = min_value + factor * (max_value - min_value)
-        if estimate < 1000:
-            return int(round(estimate))
-        # Dla większych kwot zaokrąglamy do setek, aby ograniczyć „szum” i ułatwić komunikację ceny.
-        # round(x, -2) w Pythonie oznacza zaokrąglenie do setek (ujemna precyzja: zeruje dziesiątki i jedności).
-        return int(round(estimate, cls.ROUNDING_PRECISION_HUNDREDS))
-
-    @staticmethod
-    def _normalize_text(text: str) -> str:
-        if not text:
-            return ""
-        normalized = unicodedata.normalize("NFKD", text)
-        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
-        return " ".join(re.split(r"[^a-z0-9]+", ascii_text.lower())).strip()
-
-    @staticmethod
-    def _safe_int(value):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _safe_float(value):
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None

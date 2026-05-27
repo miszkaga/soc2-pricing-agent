@@ -13,6 +13,8 @@ services:
       - "5422:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./credentials.json:/app/credentials.json # <--- I TO, ŻEBY MIEĆ PEWNOŚĆ
+      - ./token.json:/app/token.json  # <--- TO JEST KLUCZOWE
 
   agent:
     build: .
