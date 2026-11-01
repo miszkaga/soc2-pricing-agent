@@ -34,7 +34,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 # Używamy połączenia wewnątrz Dockera (host 'db')
 DB_URI = os.getenv("DB_URI", "postgresql://admin:password123@db:5432/soc2_agent")
-ALLOWED_EMAILS = ["user@example.com", "miszkaga@gmail.com"]
+# Comma-separated list of senders whose e-mails the agent processes
+ALLOWED_EMAILS = [e.strip() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()]
 
 # ==========================================
 # 2. DEFINICJA AGENTA (LANGGRAPH)
